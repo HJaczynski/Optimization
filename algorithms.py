@@ -5,6 +5,10 @@ import time
 from scipy.optimize import line_search
 import warnings
 from scipy.optimize._linesearch import scalar_search_wolfe2
+import matplotlib.pyplot as plt
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.metrics import classification_report, roc_auc_score, precision_score, recall_score
+
 
 def squared_hinge_loss(w, X, y, C):
     """
@@ -101,6 +105,7 @@ class ConjugateGradientSolver:
     def __init__(self, max_iter=200, tol=1e-3):
         self.max_iter = max_iter
         self.tol = tol
+        self.loss_history = []
     
     def solve(self, X, y, C):
         """
@@ -116,6 +121,7 @@ class ConjugateGradientSolver:
         loss : final loss value
         duration : optimization time
         """
+
         n_features = X.shape[1]
         w = np.zeros(n_features)
         
@@ -134,9 +140,11 @@ class ConjugateGradientSolver:
             if grad_norm < self.tol:
                 print(f"Converged at iteration {k}, gradient norm: {grad_norm:.6e}")
                 break
+
             
             # initial loss
             f0 = squared_hinge_loss(w, X, y, C)
+            self.loss_history.append(f0)
             
             # Line search using more theunte specified from proffesor Pytlak
             alpha = more_thuente_line_search(
@@ -154,7 +162,7 @@ class ConjugateGradientSolver:
             if k % 10 == 0:
                 loss_val = squared_hinge_loss(w_new, X, y, C)
                 print(f"Iter {k:3d}: loss = {loss_val:.6e}, grad_norm = {np.linalg.norm(g_new):.6e}, alpha = {alpha:.6e}")
-            
+
             y_cg = g_new - g
             beta_pr = np.dot(g_new, y_cg) / np.dot(g, g)
             beta = max(0, beta_pr)
@@ -182,18 +190,20 @@ class ConjugateGradientSolver:
                 RuntimeWarning
             )
         
-        return w, final_loss, duration
+        return w, final_loss, duration, self.loss_history
 
 class LBFGSSolver:
     """Limited-memory BFGS via SciPy."""
     def __init__(self):
-        pass
+        self.loss_history = []
 
     def solve(self, X, y, C):
         n_features = X.shape[1]
 
         def f(w):
-            return squared_hinge_loss(w, X, y, C)
+            loss = squared_hinge_loss(w, X, y, C)
+            self.loss_history.append(loss)
+            return loss
 
         def grad(w):
             return squared_hinge_grad(w, X, y, C)
@@ -202,12 +212,14 @@ class LBFGSSolver:
         result = minimize(f, np.zeros(n_features), jac=grad, method='L-BFGS-B') #Limited-memory BFGS with bounds but ask if this is the correct approach or do we need to write it ourselves
         # https://en.wikipedia.org/wiki/Limited-memory_BFGS, 5th lecture slide 6-7
         duration = time.time() - start
-        return result.x, result.fun, duration
+        return result.x, result.fun, duration, self.loss_history
 
 class TrustRegionNewtonSolver:
     """TRON using SciPy's trust-ncg with Hessian-vector products."""
-    def __init__(self):
-        pass
+    def __init__(self, tol=1e-3, max_iter=200):
+        self.tol = tol
+        self.max_iter = max_iter
+        self.loss_history = []
 
     def solve(self, X, y, C):
         n_features = X.shape[1]
@@ -220,12 +232,15 @@ class TrustRegionNewtonSolver:
 
         def hessp(w, v):
             return squared_hinge_hessp(w, X, y, C, v)
+        
+        def callback(wk):
+            self.loss_history.append(f(wk))
 
         start = time.time()
         result = minimize(f, np.zeros(n_features), jac=grad, #same as before, 2nd lecture slide 12
-                          method='trust-ncg', hessp=hessp)
+                          method='trust-ncg', hessp=hessp, callback=callback, options={'maxiter': self.max_iter, 'gtol': self.tol})
         duration = time.time() - start
-        return result.x, result.fun, duration
+        return result.x, result.fun, duration, self.loss_history
 
 class SquaredHingeClassifier(BaseEstimator, ClassifierMixin):
     """Binary classifier using squared-hinge loss and pluggable solvers."""
@@ -235,7 +250,7 @@ class SquaredHingeClassifier(BaseEstimator, ClassifierMixin):
         self._solver_map = {
             'cg': ConjugateGradientSolver(),
             'lbfgs': LBFGSSolver(),
-            'tron': TrustRegionNewtonSolver()
+            'tron': TrustRegionNewtonSolver(tol=1e-3, max_iter=200)
         }
 
     def fit(self, X, y):
@@ -245,7 +260,8 @@ class SquaredHingeClassifier(BaseEstimator, ClassifierMixin):
         solver = self._solver_map.get(self.solver)
         if solver is None:
             raise ValueError(f"Unknown solver '{self.solver}'.")
-        self.w_, self.loss_, self.time_ = solver.solve(X, y_trans, self.C)
+        self.w_, self.loss_, self.time_, self.loss_history_ = solver.solve(X, y_trans, self.C)
+
         return self
 
     def decision_function(self, X):
@@ -253,3 +269,46 @@ class SquaredHingeClassifier(BaseEstimator, ClassifierMixin):
 
     def predict(self, X):
         return np.where(self.decision_function(X) >= 0, self.classes_[1], self.classes_[0])
+
+
+def cross_validate_C(X, y, solver):
+    param_grid = {'C': np.logspace(-3, 3, 7)}
+    clf = SquaredHingeClassifier()
+    grid = GridSearchCV(clf, param_grid, scoring='accuracy', cv=StratifiedKFold(2),
+                        return_train_score=True)
+    grid.fit(X, y)
+    return grid
+    
+def plot_train_val_error(grid, title="Train vs Validation Accuracy"):
+    Cs = grid.cv_results_['param_C'].data
+    train_scores = grid.cv_results_['mean_train_score']
+    val_scores = grid.cv_results_['mean_test_score']
+
+    plt.figure(figsize=(8, 5))
+    plt.semilogx(Cs, train_scores, label='Train Accuracy', marker='o')
+    plt.semilogx(Cs, val_scores, label='Validation Accuracy', marker='s')
+    plt.xlabel("C (log scale)")
+    plt.ylabel("Accuracy")
+    plt.title(title)
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+def evaluate_model(model, X_test, y_test):
+    y_pred = model.predict(X_test)
+    print("Classification Report:\n", classification_report(y_test, y_pred))
+    print("ROC AUC:", roc_auc_score(y_test, y_pred))
+    print("Precision:", precision_score(y_test, y_pred))
+    print("Recall:", recall_score(y_test, y_pred))
+    print("Weight norm:", np.linalg.norm(model.w_))
+
+def plot_convergence(loss_history, title="Convergence Plot", xscale='linear'):
+    plt.figure(figsize=(8, 5))
+    plt.plot(loss_history, marker='o')
+    plt.xlabel("Iteration")
+    plt.ylabel("Objective Value")
+    plt.title(title)
+    plt.grid(True)
+    plt.xscale(xscale)
+    plt.show()
