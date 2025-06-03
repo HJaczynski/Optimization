@@ -8,6 +8,8 @@ from scipy.optimize._linesearch import scalar_search_wolfe2
 
 def squared_hinge_loss(w, X, y, C):
     """
+    Compute squared hinge loss with L2 regularization.
+    
     Parameters:
     w : weight vector
     X : feature matrix
@@ -15,10 +17,13 @@ def squared_hinge_loss(w, X, y, C):
     C : regularization parameter
     """
     margins = 1 - y * (X @ w)
-    return 0.5 * np.dot(w, w) + C * np.sum(np.maximum(0, margins)**2) #return 0.5 of the dot prodct of w, because we take into account the gradeint which would tourn it into 1 not 2 
+    hinge_part = np.maximum(0, margins)**2
+    return 0.5 * np.dot(w, w) + C * np.sum(hinge_part) #return 0.5 of the dot prodct of w, because we take into account the gradeint which would tourn it into 1 not 2 
 
-def squared_hinge_grad(w, X, y, C): # calculate the gradient of the squared hinge loss 
+def squared_hinge_grad(w, X, y, C):
     """
+    Compute gradient of squared hinge loss with L2 regularization.
+    
     Parameters:
     w : weight vector
     X : feature matrix
@@ -26,8 +31,15 @@ def squared_hinge_grad(w, X, y, C): # calculate the gradient of the squared hing
     C : regularization parameter
     """
     margins = 1 - y * (X @ w)
-    grad = -2 * C * (X.T @ (y * np.maximum(0, margins)))
-    return w + grad
+    active_mask = margins > 0
+    
+    if np.any(active_mask):
+        hinge_grad = -2 * C * (X[active_mask].T @ (y[active_mask] * margins[active_mask]))
+    else:
+        hinge_grad = np.zeros_like(w)
+    
+    # Total gradient: L2 regularization + hinge loss gradient
+    return w + hinge_grad
 
 def squared_hinge_hessp(w, X, y, C, v):
     """Hessian-vector product for trust-region Newton."""
@@ -38,128 +50,139 @@ def squared_hinge_hessp(w, X, y, C, v):
 
 def more_thuente_line_search(f, grad, x, p, f0=None, g0=None, c1=1e-4, c2=0.9):
     """
-    Moré–Thuente (strong‐Wolfe) line search using scipy.optimize.line_search.
-    - f:      callable f(x)
-    - grad:   callable ∇f(x)
-    - x:      current point (array)
-    - p:      search direction (array)
-    - f0:     f(x) if already known (optional)
-    - g0:     ∇f(x) if already known (optional)
-    Returns α (or a small fallback if it fails).
+    More-Thuente (strong-Wolfe) line search using scipy.optimize.line_search.
     """
     if f0 is None:
         f0 = f(x)
     if g0 is None:
         g0 = grad(x)
 
-    alpha, _, _, f_new, f_old, derphi = line_search(
-        f,
-        grad,
-        x,
-        p,
-        gfk=g0,
-        old_fval=f0,
-        old_old_fval=f0
-    )
+    # Check if p is a descent direction
+    directional_derivative = np.dot(g0, p)
+    if directional_derivative >= 0:
+        print(f"p is not a descent direction (g·p = {directional_derivative})")
+        return 1e-6
 
-    if alpha is None:
-        return 1e-3
-    return alpha
+    try:
+        result = line_search(
+            f,
+            grad,
+            x,
+            p,
+            gfk=g0,
+            old_fval=f0,
+            amax=10.0,
+            c1=c1,
+            c2=c2
+        )
+        
+        alpha = result[0]
+        
+        if alpha is None or alpha <= 0:
+            # Fallback: simple backtracking
+            alpha = 1.0
+            for _ in range(20):
+                if f(x + alpha * p) <= f0 + c1 * alpha * directional_derivative:
+                    break
+                alpha *= 0.5
+            else:
+                alpha = 1e-6
+                
+    except Exception as e:
+        print(f"Line search failed: {e}")
+        alpha = 1e-6
+    
+    return max(alpha, 1e-8)  # Ensure positive step size
 
-def strong_wolfe_line_search(f, grad, x, p, c1=1e-4, c2=0.9, alpha0=1.0):
-    """
-    More-Thuente Strong-Wolfe line search via scipy.optimize._linesearch.scalar_search_wolfe2.
-    Falls back to Armijo if it fails.
-    """
-
-    phi    = lambda a: f(x + a*p)
-    derphi = lambda a: grad(x + a*p).dot(p)
-
-    phi0   = f(x)
-    derphi0 = grad(x).dot(p)
-
-    results = scalar_search_wolfe2(
-        phi, derphi, phi0=phi0, derphi0=derphi0, c1=c1, c2=c2
-    )
-    alpha = results[0]  
-    if alpha is None:
-        alpha = alpha0
-        while phi(alpha) > phi0 + c1*alpha*derphi0:
-            alpha *= 0.5
-    return alpha
 
 class ConjugateGradientSolver:
-    """Nonlinear Conjugate Gradient with Polak-Ribiere update."""
-    def __init__(self, max_iter=200, tol=1e-3, method='scipy'):
+    """Nonlinear Conjugate Gradient with Polak-Ribiere+ update."""
+    
+    def __init__(self, max_iter=200, tol=1e-3):
         self.max_iter = max_iter
         self.tol = tol
-        self.method = method
     
     def solve(self, X, y, C):
-        w = np.zeros(X.shape[1])
-        g = squared_hinge_grad(w, X, y, C) #initial gradient at w = 0
-        r = -g #residual 
-        p = r.copy()
-        start = time.time()
-        print(f"Using {self.method} LineaSearch")
-
+        """
+        Solve the squared hinge loss optimization problem.
+        
+        Parameters:
+        X : feature matrix (n_samples, n_features)
+        y : labels (n_samples,) with values in {-1, +1}
+        C : regularization parameter
+        
+        Returns:
+        w : optimal weight vector
+        loss : final loss value
+        duration : optimization time
+        """
+        n_features = X.shape[1]
+        w = np.zeros(n_features)
+        
+        # Initial gradient and search direction
+        g = squared_hinge_grad(w, X, y, C)
+        p = -g.copy()  # Initial search direction (steepest descent)
+        
+        start_time = time.time()
+        
+        print("Starting Conjugate Gradient optimization...")
+        print(f"Initial gradient norm: {np.linalg.norm(g):.6e}")
+        
         for k in range(self.max_iter):
-            if self.method == 'scipy':
-                f0 = squared_hinge_loss(w, X, y, C)
-                g0 = squared_hinge_grad(w, X, y, C)
-
-                # inside the loop, instead of backtracking:
-                alpha = more_thuente_line_search(
-                    lambda v: squared_hinge_loss(v, X, y, C),
-                    lambda v: squared_hinge_grad(v, X, y, C),
-                    w, p,
-                    f0=f0, g0=g0,
-                    c1=1e-4, c2=0.9
-                )
-                w_new = w + alpha * p
-                g_new = squared_hinge_grad(w_new, X, y, C)
-                r_new = -g_new
-
-                # convergence check
-                if np.linalg.norm(g_new) < self.tol:
-                    w = w_new
-                    break
-            else:
-                alpha = strong_wolfe_line_search(
-                    lambda v: squared_hinge_loss(v, X, y, C),
-                    lambda v: squared_hinge_grad(v, X, y, C),
-                    w, p,
-                    c1=1e-4, c2=0.9, alpha0=1.0
-                )
-            
-            #calculate new weights, gradient
-            w_new = w + alpha * p 
-            g_new = squared_hinge_grad(w_new, X, y, C)
-            r_new = -g_new
-
-            if np.linalg.norm(g_new) < self.tol:
-                w = w_new
+            # Check convergence, because we had problems with the line search that needed to be fixed and wanted to make sure it works
+            grad_norm = np.linalg.norm(g)
+            if grad_norm < self.tol:
+                print(f"Converged at iteration {k}, gradient norm: {grad_norm:.6e}")
                 break
-
-            beta = max(0, (r_new.dot(r_new - r)) / (r.dot(r))) #2nd lecture slide 18 formula 
-            p = r_new + beta * p #descent direction from same slide
-
-            if p.dot(squared_hinge_grad(w_new, X, y, C)) >= 0:
-                # restart: force pure steepest descent
-                p = r_new.copy()
-
-            w, g, r = w_new, g_new, r_new
-
-        duration = time.time() - start
-        final_grad = squared_hinge_grad(w, X, y, C)
-        loss       = squared_hinge_loss(w, X, y, C)
-
-        if np.linalg.norm(final_grad) > self.tol:
+            
+            # initial loss
+            f0 = squared_hinge_loss(w, X, y, C)
+            
+            # Line search using more theunte specified from proffesor Pytlak
+            alpha = more_thuente_line_search(
+                lambda v: squared_hinge_loss(v, X, y, C),
+                lambda v: squared_hinge_grad(v, X, y, C),
+                w, p,
+                f0=f0, g0=g
+            )
+            
+            # Update weights after getting alpha from line search 
+            w_new = w + alpha * p
+            g_new = squared_hinge_grad(w_new, X, y, C)
+            
+            # Print loss and gradient norm for check, as previously mentioned we had problem with convergence 
+            if k % 10 == 0:
+                loss_val = squared_hinge_loss(w_new, X, y, C)
+                print(f"Iter {k:3d}: loss = {loss_val:.6e}, grad_norm = {np.linalg.norm(g_new):.6e}, alpha = {alpha:.6e}")
+            
+            y_cg = g_new - g
+            beta_pr = np.dot(g_new, y_cg) / np.dot(g, g)
+            beta = max(0, beta_pr)
+            
+            p_new = -g_new + beta * p
+            
+            # Restart condition: check if new direction is descent
+            if np.dot(p_new, g_new) >= 0:
+                p_new = -g_new  # Reset to steepest descent
+            
+            w, g, p = w_new, g_new, p_new
+        
+        duration = time.time() - start_time
+        final_loss = squared_hinge_loss(w, X, y, C)
+        final_grad_norm = np.linalg.norm(squared_hinge_grad(w, X, y, C))
+        
+        #additional check to see the convergence 
+        print(f"Optimization completed in {duration:.3f} seconds")
+        print(f"Final loss: {final_loss:.6e}")
+        print(f"Final gradient norm: {final_grad_norm:.6e}")
+        
+        if final_grad_norm > self.tol:
             warnings.warn(
-               "CG doesn't converge",
+                f"CG did not converge. Final gradient norm: {final_grad_norm:.6e} > {self.tol}",
                 RuntimeWarning
             )
-        return w, loss, duration
+        
+        return w, final_loss, duration
 
 class LBFGSSolver:
     """Limited-memory BFGS via SciPy."""
@@ -206,11 +229,11 @@ class TrustRegionNewtonSolver:
 
 class SquaredHingeClassifier(BaseEstimator, ClassifierMixin):
     """Binary classifier using squared-hinge loss and pluggable solvers."""
-    def __init__(self, C=1.0, solver='lbfgs', method='scipy'):
+    def __init__(self, C=1.0, solver='lbfgs'):
         self.C = C
         self.solver = solver
         self._solver_map = {
-            'cg': ConjugateGradientSolver(method=method),
+            'cg': ConjugateGradientSolver(),
             'lbfgs': LBFGSSolver(),
             'tron': TrustRegionNewtonSolver()
         }
