@@ -8,6 +8,7 @@ from scipy.optimize._linesearch import scalar_search_wolfe2
 import matplotlib.pyplot as plt
 from sklearn.model_selection import GridSearchCV, StratifiedKFold
 from sklearn.metrics import classification_report, roc_auc_score, precision_score, recall_score
+from sklearn.preprocessing import StandardScaler
 
 
 def squared_hinge_loss(w, X, y, C):
@@ -48,64 +49,61 @@ def squared_hinge_grad(w, X, y, C):
 def squared_hinge_hessp(w, X, y, C, v):
     """Hessian-vector product for trust-region Newton."""
     margins = 1 - y * (X @ w)
-    Xv = X @ v
-    Hv = v + 2 * C * (X.T @ (np.maximum(0, margins) * Xv))
+    active_mask = margins > 0
+    
+    if not np.any(active_mask):
+        return v
+    
+    X_active = X[active_mask]
+    
+    # Hv = v + 2*C * X_active^T @ (X_active @ v)
+    Xv_active = X_active @ v
+    Hv = v + 2 * C * (X_active.T @ Xv_active)
+    
     return Hv
 
-def more_thuente_line_search(f, grad, x, p, f0=None, g0=None, c1=1e-4, c2=0.9):
+def armijo_backtracking(f, x, p, gdotp, f0, c1=1e-4, max_iter=150):
     """
-    More-Thuente (strong-Wolfe) line search using scipy.optimize.line_search.
+    Pure Armijo back-tracking:  f(x+αp) ≤ f0 + c1 α g·p.
     """
-    if f0 is None:
-        f0 = f(x)
-    if g0 is None:
-        g0 = grad(x)
+    alpha = 1.0
+    for _ in range(max_iter):
+        if f(x + alpha * p) <= f0 + c1 * alpha * gdotp:
+            return alpha
+        alpha *= 0.5
+    return max(alpha, 1e-8) 
 
-    # Check if p is a descent direction
-    directional_derivative = np.dot(g0, p)
-    if directional_derivative >= 0:
-        print(f"p is not a descent direction (g·p = {directional_derivative})")
-        return 1e-6
-
-    try:
-        result = line_search(
-            f,
-            grad,
-            x,
-            p,
-            gfk=g0,
-            old_fval=f0,
-            amax=10.0,
-            c1=c1,
-            c2=c2
-        )
-        
-        alpha = result[0]
-        
-        if alpha is None or alpha <= 0:
-            # Fallback: simple backtracking
-            alpha = 1.0
-            for _ in range(20):
-                if f(x + alpha * p) <= f0 + c1 * alpha * directional_derivative:
-                    break
-                alpha *= 0.5
-            else:
-                alpha = 1e-6
-                
-    except Exception as e:
-        print(f"Line search failed: {e}")
-        alpha = 1e-6
-    
-    return max(alpha, 1e-8)  # Ensure positive step size
+def strong_wolfe_more_thuente(f, grad, x, p, f0, g0,
+                              c1=1e-4, c2=0.4):
+    """
+    Wrapper around SciPy’s cubic line search (returns 1e-6 on failure).
+    """
+    alpha, *_ = line_search(f, grad, x, p,
+                            gfk=g0, old_fval=f0,
+                            c1=c1, c2=c2, amax=10.0)
+    if alpha is None or alpha <= 0:
+        alpha = armijo_backtracking(f, x, p, np.dot(g0, p), f0, c1)
+    return alpha
 
 
 class ConjugateGradientSolver:
     """Nonlinear Conjugate Gradient with Polak-Ribiere+ update."""
     
-    def __init__(self, max_iter=200, tol=1e-3):
+    def __init__(self, max_iter=200, tol=1e-3, switch_line = 1e-2):
         self.max_iter = max_iter
         self.tol = tol
         self.loss_history = []
+        self.f_evals = 0
+        self.g_evals = 0
+        self.switch_line_search = switch_line
+
+    def _f(self, w, X, y, C):
+        self.f_evals += 1
+        return squared_hinge_loss(w, X, y, C)
+
+    def _g(self, w, X, y, C):
+        self.g_evals += 1
+        return squared_hinge_grad(w, X, y, C)
     
     def solve(self, X, y, C):
         """
@@ -121,12 +119,13 @@ class ConjugateGradientSolver:
         loss : final loss value
         duration : optimization time
         """
+        scaler = StandardScaler()
+        X = scaler.fit_transform(X)
 
-        n_features = X.shape[1]
-        w = np.zeros(n_features)
+        w = np.zeros(X.shape[1])
         
         # Initial gradient and search direction
-        g = squared_hinge_grad(w, X, y, C)
+        g = self._g(w, X, y, C)
         p = -g.copy()  # Initial search direction (steepest descent)
         
         start_time = time.time()
@@ -143,41 +142,43 @@ class ConjugateGradientSolver:
 
             
             # initial loss
-            f0 = squared_hinge_loss(w, X, y, C)
-            self.loss_history.append(f0)
+            f0 = self._f(w, X, y, C)
+            gdotp = np.dot(g, p)
             
-            # Line search using more theunte specified from proffesor Pytlak
-            alpha = more_thuente_line_search(
-                lambda v: squared_hinge_loss(v, X, y, C),
-                lambda v: squared_hinge_grad(v, X, y, C),
-                w, p,
-                f0=f0, g0=g
-            )
-            
+            if grad_norm > self.switch_line_search:
+                alpha = armijo_backtracking(
+                    lambda z: self._f(z, X, y, C),
+                    w, p, gdotp, f0, max_iter=100)
+            else:
+                alpha = strong_wolfe_more_thuente(
+                    lambda z: self._f(z, X, y, C),
+                    lambda z: self._g(z, X, y, C),
+                    w, p, f0, g)
+
             # Update weights after getting alpha from line search 
             w_new = w + alpha * p
-            g_new = squared_hinge_grad(w_new, X, y, C)
-            
-            # Print loss and gradient norm for check, as previously mentioned we had problem with convergence 
-            if k % 10 == 0:
-                loss_val = squared_hinge_loss(w_new, X, y, C)
-                print(f"Iter {k:3d}: loss = {loss_val:.6e}, grad_norm = {np.linalg.norm(g_new):.6e}, alpha = {alpha:.6e}")
+            g_new = self._g(w_new, X, y, C)
 
-            y_cg = g_new - g
-            beta_pr = np.dot(g_new, y_cg) / np.dot(g, g)
-            beta = max(0, beta_pr)
-            
+            y_cg  = g_new - g
+            beta  = max(0.0, np.dot(g_new, y_cg) / np.dot(g, g))  # PR+
             p_new = -g_new + beta * p
-            
-            # Restart condition: check if new direction is descent
             if np.dot(p_new, g_new) >= 0:
-                p_new = -g_new  # Reset to steepest descent
+                p_new = -g_new
+
+            self.loss_history.append(f0)
+            
+            if k % 10 == 0:
+                print(f" k={k:<3d}  f={f0:.3e}  ‖g‖={grad_norm:.1e}  α={alpha:.2e}")
             
             w, g, p = w_new, g_new, p_new
         
         duration = time.time() - start_time
-        final_loss = squared_hinge_loss(w, X, y, C)
-        final_grad_norm = np.linalg.norm(squared_hinge_grad(w, X, y, C))
+        final_loss = self._f(w, X, y, C)
+        final_grad_norm = np.linalg.norm(self._g(w, X, y, C))
+
+        print(f"\nDone with {k+1} iterations.")
+        print(f"\n{self.f_evals} function evaluations, {self.g_evals} gradient evaluations.")
+        print(f"f_evals per iteration {self.f_evals / k +1:.2f}, g_evals per iteration {self.g_evals / k +1:.2f}")
         
         #additional check to see the convergence 
         print(f"Optimization completed in {duration:.3f} seconds")
