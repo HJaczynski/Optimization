@@ -56,11 +56,24 @@ def squared_hinge_hessp(w, X, y, C, v):
     
     X_active = X[active_mask]
     
-    # Hv = v + 2*C * X_active^T @ (X_active @ v)
     Xv_active = X_active @ v
     Hv = v + 2 * C * (X_active.T @ Xv_active)
     
     return Hv
+
+def compute_full_hessian(w, X, y, C):
+    """Compute the FULL Hessian matrix"""
+    n_features = X.shape[1]
+    margins = 1 - y * (X @ w)
+    active_mask = margins > 0
+    
+    H = np.eye(n_features)
+    
+    if np.any(active_mask):
+        X_active = X[active_mask]
+        H += 2 * C * (X_active.T @ X_active)
+        
+    return H
 
 def armijo_backtracking(f, x, p, gdotp, f0, c1=1e-4, max_iter=150):
     """
@@ -168,7 +181,7 @@ class ConjugateGradientSolver:
             self.loss_history.append(f0)
             
             if k % 10 == 0:
-                print(f" k={k:<3d}  f={f0:.3e}  ‖g‖={grad_norm:.1e}  α={alpha:.2e}")
+                print(f"Iter {k:3d}: loss = {f0:.6e}, grad_norm = {np.linalg.norm(g_new):.6e}, alpha = {alpha:.6e}")
             
             w, g, p = w_new, g_new, p_new
         
@@ -217,10 +230,11 @@ class LBFGSSolver:
 
 class TrustRegionNewtonSolver:
     """TRON using SciPy's trust-ncg with Hessian-vector products."""
-    def __init__(self, tol=1e-3, max_iter=200):
+    def __init__(self, tol=1e-3, max_iter=200, full_hessian=False):
         self.tol = tol
         self.max_iter = max_iter
         self.loss_history = []
+        self.full_hessian = full_hessian
 
     def solve(self, X, y, C):
         n_features = X.shape[1]
@@ -231,27 +245,34 @@ class TrustRegionNewtonSolver:
         def grad(w):
             return squared_hinge_grad(w, X, y, C)
 
-        def hessp(w, v):
-            return squared_hinge_hessp(w, X, y, C, v)
         
+        extra = {}
+        if self.full_hessian:
+            def H(w):
+                return compute_full_hessian(w, X, y, C)
+            extra['hess'] = H
+        else:
+            def Hv(w, v):
+                return squared_hinge_hessp(w, X, y, C, v)
+            extra['hessp'] = Hv
+            
         def callback(wk):
             self.loss_history.append(f(wk))
 
         start = time.time()
-        result = minimize(f, np.zeros(n_features), jac=grad, #same as before, 2nd lecture slide 12
-                          method='trust-ncg', hessp=hessp, callback=callback, options={'maxiter': self.max_iter, 'gtol': self.tol})
+        result = minimize(f, np.zeros(n_features), jac=grad, method='trust-ncg', callback=callback, options={'gtol': self.tol, 'maxiter': self.max_iter, 'disp': False}, **extra)
         duration = time.time() - start
         return result.x, result.fun, duration, self.loss_history
 
 class SquaredHingeClassifier(BaseEstimator, ClassifierMixin):
     """Binary classifier using squared-hinge loss and pluggable solvers."""
-    def __init__(self, C=1.0, solver='lbfgs'):
+    def __init__(self, C=1.0, solver='lbfgs', full_hessian=False):
         self.C = C
         self.solver = solver
         self._solver_map = {
             'cg': ConjugateGradientSolver(),
             'lbfgs': LBFGSSolver(),
-            'tron': TrustRegionNewtonSolver(tol=1e-3, max_iter=200)
+            'tron': TrustRegionNewtonSolver(tol=1e-3, max_iter=200, full_hessian=full_hessian)
         }
 
     def fit(self, X, y):
