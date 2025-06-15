@@ -180,8 +180,8 @@ class ConjugateGradientSolver:
 
             self.loss_history.append(f0)
             
-            if k % 10 == 0:
-                print(f"Iter {k:3d}: loss = {f0:.6e}, grad_norm = {np.linalg.norm(g_new):.6e}, alpha = {alpha:.6e}")
+#            if k % 10 == 0:
+#                print(f"Iter {k:3d}: loss = {f0:.6e}, grad_norm = {np.linalg.norm(g_new):.6e}, alpha = {alpha:.6e}")
             
             w, g, p = w_new, g_new, p_new
         
@@ -204,29 +204,33 @@ class ConjugateGradientSolver:
                 RuntimeWarning
             )
         
-        return w, final_loss, duration, self.loss_history
+        return w, final_loss, duration, self.loss_history, self.f_evals, self.g_evals
 
 class LBFGSSolver:
     """Limited-memory BFGS via SciPy."""
     def __init__(self):
         self.loss_history = []
+        self.f_evals = 0
+        self.g_evals = 0
 
     def solve(self, X, y, C):
         n_features = X.shape[1]
 
         def f(w):
+            self.f_evals += 1
             loss = squared_hinge_loss(w, X, y, C)
             self.loss_history.append(loss)
             return loss
 
         def grad(w):
+            self.g_evals += 1
             return squared_hinge_grad(w, X, y, C)
 
         start = time.time()
         result = minimize(f, np.zeros(n_features), jac=grad, method='L-BFGS-B') #Limited-memory BFGS with bounds but ask if this is the correct approach or do we need to write it ourselves
         # https://en.wikipedia.org/wiki/Limited-memory_BFGS, 5th lecture slide 6-7
         duration = time.time() - start
-        return result.x, result.fun, duration, self.loss_history
+        return result.x, result.fun, duration, self.loss_history, self.f_evals, self.g_evals
 
 class TrustRegionNewtonSolver:
     """TRON using SciPy's trust-ncg with Hessian-vector products."""
@@ -235,14 +239,19 @@ class TrustRegionNewtonSolver:
         self.max_iter = max_iter
         self.loss_history = []
         self.full_hessian = full_hessian
+        self.f_evals = 0
+        self.g_evals = 0
+
 
     def solve(self, X, y, C):
         n_features = X.shape[1]
 
         def f(w):
+            self.f_evals += 1
             return squared_hinge_loss(w, X, y, C)
 
         def grad(w):
+            self.g_evals += 1
             return squared_hinge_grad(w, X, y, C)
 
         
@@ -262,17 +271,20 @@ class TrustRegionNewtonSolver:
         start = time.time()
         result = minimize(f, np.zeros(n_features), jac=grad, method='trust-ncg', callback=callback, options={'gtol': self.tol, 'maxiter': self.max_iter, 'disp': False}, **extra)
         duration = time.time() - start
-        return result.x, result.fun, duration, self.loss_history
+        return result.x, result.fun, duration, self.loss_history, self.f_evals, self.g_evals
 
 class SquaredHingeClassifier(BaseEstimator, ClassifierMixin):
     """Binary classifier using squared-hinge loss and pluggable solvers."""
     def __init__(self, C=1.0, solver='lbfgs', full_hessian=False):
         self.C = C
         self.solver = solver
+        self.full_hessian = full_hessian
         self._solver_map = {
             'cg': ConjugateGradientSolver(),
             'lbfgs': LBFGSSolver(),
-            'tron': TrustRegionNewtonSolver(tol=1e-3, max_iter=200, full_hessian=full_hessian)
+            'tron': TrustRegionNewtonSolver(tol=1e-3, max_iter=200, full_hessian=full_hessian),
+            'tron_full': TrustRegionNewtonSolver(tol=1e-3, max_iter=200, full_hessian=True)
+
         }
 
     def fit(self, X, y):
@@ -282,7 +294,7 @@ class SquaredHingeClassifier(BaseEstimator, ClassifierMixin):
         solver = self._solver_map.get(self.solver)
         if solver is None:
             raise ValueError(f"Unknown solver '{self.solver}'.")
-        self.w_, self.loss_, self.time_, self.loss_history_ = solver.solve(X, y_trans, self.C)
+        self.w_, self.loss_, self.time_, self.loss_history_, self.f_evals_, self.g_evals_ = solver.solve(X, y_trans, self.C)
 
         return self
 
@@ -291,11 +303,11 @@ class SquaredHingeClassifier(BaseEstimator, ClassifierMixin):
 
     def predict(self, X):
         return np.where(self.decision_function(X) >= 0, self.classes_[1], self.classes_[0])
-
+    
 
 def cross_validate_C(X, y, solver):
     param_grid = {'C': np.logspace(-3, 3, 7)}
-    clf = SquaredHingeClassifier()
+    clf = SquaredHingeClassifier(solver=solver)
     grid = GridSearchCV(clf, param_grid, scoring='accuracy', cv=StratifiedKFold(2),
                         return_train_score=True)
     grid.fit(X, y)
@@ -311,6 +323,7 @@ def plot_train_val_error(grid, title="Train vs Validation Accuracy"):
     plt.semilogx(Cs, val_scores, label='Validation Accuracy', marker='s')
     plt.xlabel("C (log scale)")
     plt.ylabel("Accuracy")
+    plt.ylim(0, 1)
     plt.title(title)
     plt.legend()
     plt.grid(True)
