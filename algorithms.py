@@ -208,10 +208,12 @@ class ConjugateGradientSolver:
 
 class LBFGSSolver:
     """Limited-memory BFGS via SciPy."""
-    def __init__(self):
+    def __init__(self, max_iter=200, tol=1e-3):
         self.loss_history = []
         self.f_evals = 0
         self.g_evals = 0
+        self.max = max_iter
+        self.tol = tol
 
     def solve(self, X, y, C):
         n_features = X.shape[1]
@@ -227,7 +229,7 @@ class LBFGSSolver:
             return squared_hinge_grad(w, X, y, C)
 
         start = time.time()
-        result = minimize(f, np.zeros(n_features), jac=grad, method='L-BFGS-B') #Limited-memory BFGS with bounds but ask if this is the correct approach or do we need to write it ourselves
+        result = minimize(f, np.zeros(n_features), jac=grad, method='L-BFGS-B', options={'maxiter': self.max, 'gtol': self.tol}) #Limited-memory BFGS with bounds but ask if this is the correct approach or do we need to write it ourselves
         # https://en.wikipedia.org/wiki/Limited-memory_BFGS, 5th lecture slide 6-7
         duration = time.time() - start
         return result.x, result.fun, duration, self.loss_history, self.f_evals, self.g_evals
